@@ -10,11 +10,18 @@
 #include <mutex>
 #include <vector>
 #include <algorithm>
+#include <random>
+#include <sstream>
+#include <iomanip>
 
 #define BUFFER_SIZE 1024
 
+unsigned seed;
 std::mutex mtx;
-int core_list[] = {2,4,6,8,10,12,14,16};
+std::vector<int> core_list;
+
+int key_size = 64;
+int value_size = 128;
 
 int connect_to_server(const std::string& server_ip, int server_port) {
     int sock = 0;
@@ -39,6 +46,13 @@ int connect_to_server(const std::string& server_ip, int server_port) {
     }
 
     return sock;
+}
+
+void send_command(int sock, const std::string& command) {
+    char buffer[BUFFER_SIZE] = {0};
+
+    send(sock, command.c_str(), command.size(), 0);
+    int ret __attribute__((unused)) = read(sock, buffer, BUFFER_SIZE);
 }
 
 long long send_command_and_measure_latency(int sock, const std::string& command) {
@@ -92,26 +106,51 @@ void set_thread_affinity(std::thread& thread, int core_idx) {
     }
 }
 
-// Função para processar comandos SET e GET em uma thread
-void process_commands(int thread_id, int num_requests_per_thread, const std::string& server_ip, int server_port, std::vector<long long>& latencies) {
-    int sock = connect_to_server(server_ip, server_port);
+void process_commands(int thread_id, int warming_up_requests_per_thread, int num_requests_per_thread, const std::string& server_ip, int server_port, std::vector<long long>& latencies, double get_ratio) {
+    int sock = connect_to_server(server_ip, server_port + thread_id);
     
+    std::mt19937 gen(seed + thread_id);
+    std::uniform_real_distribution<> dis(0.0, 1.0);
+
     std::string key_base = "key";
     std::string value_base = "value";
 
+    /* Warming up */
+    for (int i = 0; i < warming_up_requests_per_thread; i++) {
+        std::ostringstream key_stream;
+        key_stream << key_base << std::setw(key_size - key_base.length()) << std::setfill('0') << (thread_id * num_requests_per_thread + i);
+        std::string key = key_stream.str();
+
+        std::ostringstream value_stream;
+        value_stream << value_base << std::setw(value_size - value_base.length()) << std::setfill('0') << (thread_id * num_requests_per_thread + i);
+        std::string value = value_stream.str();
+
+        std::string set_command = "SET " + key + " " + value;
+        send_command(sock, set_command);
+    }
+
     for (int i = 0; i < num_requests_per_thread; ++i) {
-        std::string key = key_base + std::to_string(thread_id * num_requests_per_thread + i);
-        std::string value = value_base + std::to_string(thread_id * num_requests_per_thread + i);
+        double rand_value = dis(gen);
+        std::ostringstream key_stream;
+        key_stream << key_base << std::setw(key_size - key_base.length()) << std::setfill('0') << (thread_id * num_requests_per_thread + i);
+        std::string key = key_stream.str();
 
-        // std::string set_command = "SET " + key + " " + value;
-        // long long set_latency = send_command_and_measure_latency(sock, set_command);
+        std::ostringstream value_stream;
+        value_stream << value_base << std::setw(value_size - value_base.length()) << std::setfill('0') << (thread_id * num_requests_per_thread + i);
+        std::string value = value_stream.str();
 
-        std::string get_command = "GET " + key;
-        long long get_latency = send_command_and_measure_latency(sock, get_command);
+        long long latency;
+        std::string command;
+
+        if (rand_value < get_ratio) {
+            command = "GET " + key;
+        } else {
+            command = "SET " + key + " " + value;
+        }
+        latency = send_command_and_measure_latency(sock, command);
 
         mtx.lock();
-        // latencies.push_back(set_latency);
-        latencies.push_back(get_latency);
+        latencies.push_back(latency);
         mtx.unlock();
     }
 
@@ -119,23 +158,74 @@ void process_commands(int thread_id, int num_requests_per_thread, const std::str
 }
 
 int main(int argc, char* argv[]) {
-    if (argc != 5) {
-        fprintf(stderr, "USE: %s <server_ip> <server_port> <num_requests> <num_threads>\n", argv[0]);
+    std::string server_ip;
+    int server_port = 0;
+    int num_requests = 0;
+    int num_threads = 0;
+    bool direct_output = false;
+    double get_ratio = 1.0;
+    int warming_up_requests = 0;
+    seed = std::chrono::system_clock::now().time_since_epoch().count();
+
+    int opt;
+    while ((opt = getopt(argc, argv, "h:p:n:t:l:fm:s:w:")) != -1) {
+        switch (opt) {
+            case 'h':
+                server_ip = optarg;
+                break;
+            case 'p':
+                server_port = std::stoi(optarg);
+                break;
+            case 'n':
+                num_requests = std::stoi(optarg);
+                break;
+            case 't':
+                num_threads = std::stoi(optarg);
+                break;
+            case 'l': {
+                std::string list_str = optarg;
+                std::stringstream ss(list_str);
+                std::string item;
+                while (std::getline(ss, item, ',')) {
+                    core_list.push_back(std::stoi(item));
+                }
+                break;
+            }
+            case 'f':
+                direct_output = true;
+                break;
+            case 'm':
+                get_ratio = std::stod(optarg);
+                if (get_ratio < 0.0 || get_ratio > 1.0) {
+                    fprintf(stderr, "A proporção de GET/SET deve estar entre 0 e 1.\n");
+                    exit(EXIT_FAILURE);
+                }
+                break;
+            case 's':
+                seed = std::stoul(optarg);
+                break;
+            case 'w':
+                warming_up_requests = std::stoi(optarg);
+                break;
+            default:
+                fprintf(stderr, "Usage: %s -h <server_ip> -p <server_port> -n <num_requests> -t <num_threads> -l <list_of_cores> -m <GET/GET proportion> [-f] [-s <seed]\n", argv[0]);
+                exit(EXIT_FAILURE);
+        }
+    }
+
+    if (server_ip.empty() || server_port == 0 || num_requests == 0 || num_threads == 0 || core_list.empty()) {
+        fprintf(stderr, "Usage: %s -h <server_ip> -p <server_port> -n <num_requests> -t <num_threads> -l <list_of_integers>\n", argv[0]);
         exit(-1);
     }
 
-    std::string server_ip = argv[1];
-    int server_port = std::stoi(argv[2]);
-    int num_requests = std::stoi(argv[3]);
-    int num_threads = std::stoi(argv[4]);
-
+    int warming_up_requests_per_thread = warming_up_requests / num_threads;
     int num_requests_per_thread = num_requests / num_threads;
 
     std::vector<long long> latencies;
 
     std::vector<std::thread> threads;
     for (int i = 0; i < num_threads; ++i) {
-        threads.emplace_back(process_commands, i, num_requests_per_thread, std::ref(server_ip), server_port + i, std::ref(latencies));
+        threads.emplace_back(process_commands, i, warming_up_requests_per_thread, num_requests_per_thread, std::ref(server_ip), server_port, std::ref(latencies), get_ratio);
         set_thread_affinity(threads.back(), i);
     }
 
@@ -148,15 +238,23 @@ int main(int argc, char* argv[]) {
     double total_time = std::accumulate(latencies.begin(), latencies.end(), 0LL) / 1e6;
     double throughput = (num_requests * num_threads) / total_time;
 
-    printf("Latency (us):\n");
-    printf("avg: %lf\n", avg);
-    printf("p50: %lld\n", percentiles[0]);
-    printf("p75: %lld\n", percentiles[1]);
-    printf("p90: %lld\n", percentiles[2]);
-    printf("p99: %lld\n", percentiles[3]);
-    printf("p99.9: %lld\n", percentiles[4]);
-    printf("p99.99: %lld\n", percentiles[5]);
-    printf("Throughput: %lf RPS\n", throughput);
+    if (direct_output) {
+        printf("%lf,%lld,%lld,%lf\n", 
+                avg, 
+                percentiles[0], 
+                percentiles[4], 
+                throughput);
+    } else {
+        printf("Latency (us):\n");
+        printf("avg: %lf\n", avg);                      // AVG
+        printf("p50: %lld\n", percentiles[0]);          // p50
+        // printf("p75: %lld\n", percentiles[1]);       // p75
+        // printf("p90: %lld\n", percentiles[2]);       // p90
+        // printf("p99: %lld\n", percentiles[3]);       // p99
+        printf("p99.9: %lld\n", percentiles[4]);        // p99.9
+        // printf("p99.99: %lld\n", percentiles[5]);    // p99.99
+        printf("Throughput: %lf RPS\n", throughput);
+    }
 
     return 0;
 }
