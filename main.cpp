@@ -13,15 +13,16 @@
 #include <random>
 #include <sstream>
 #include <iomanip>
+#include <stdint.h>
 
-#define BUFFER_SIZE 1024
+#define BUFFER_SIZE 2048
 
 unsigned seed;
 std::mutex mtx;
 std::vector<int> core_list;
 
-int key_size = 64;
-int value_size = 128;
+int key_size = 8;
+int value_size = 16;
 
 int connect_to_server(const std::string& server_ip, int server_port) {
     int sock = 0;
@@ -53,6 +54,26 @@ void send_command(int sock, const std::string& command) {
 
     send(sock, command.c_str(), command.size(), 0);
     int ret __attribute__((unused)) = read(sock, buffer, BUFFER_SIZE);
+}
+
+long long send_scan_and_measure_latency(int sock, const std::string& command) {
+    int ret __attribute__((unused)) = 0;
+    uint64_t remaining = 0;
+    uint64_t response_len = 0;
+    char buffer[BUFFER_SIZE] = {0};
+    auto start = std::chrono::high_resolution_clock::now();
+
+    send(sock, command.c_str(), command.size(), 0);
+    ret = read(sock, &response_len, sizeof(uint64_t));
+
+    remaining = response_len;
+    while(remaining > 0) {
+        remaining -= read(sock, buffer, BUFFER_SIZE);
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<long long, std::micro> duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    return duration.count();
 }
 
 long long send_command_and_measure_latency(int sock, const std::string& command) {
@@ -144,10 +165,13 @@ void process_commands(int thread_id, int warming_up_requests_per_thread, int num
 
         if (rand_value < get_ratio) {
             command = "GET " + key;
+            latency = send_command_and_measure_latency(sock, command);
         } else {
-            command = "SET " + key + " " + value;
+            // command = "SET " + key + " " + value;
+            command = "SCAN";
+            latency = send_scan_and_measure_latency(sock, command);
         }
-        latency = send_command_and_measure_latency(sock, command);
+        // latency = send_command_and_measure_latency(sock, command);
 
         mtx.lock();
         latencies.push_back(latency);
@@ -157,18 +181,35 @@ void process_commands(int thread_id, int warming_up_requests_per_thread, int num
     close(sock);
 }
 
+void usage(char *app) {
+    fprintf(stderr, 
+        "Usage: %s \
+        -h <server_ip> \
+        -p <server_port> \
+        -n <num_requests> \
+        -t <num_threads> \
+        -l <list_of_cores> \
+        -m <GET/SCAN proportion> \
+        [-f] \
+        [-s <seed>] \
+        [-w <warming up>] \
+        [-k <key size>] \
+        [-v <value size>]\n", app
+    );
+}
+
 int main(int argc, char* argv[]) {
     std::string server_ip;
     int server_port = 0;
     int num_requests = 0;
     int num_threads = 0;
     bool direct_output = false;
-    double get_ratio = 1.0;
+    double get_ratio = 2.0;
     int warming_up_requests = 0;
     seed = std::chrono::system_clock::now().time_since_epoch().count();
 
     int opt;
-    while ((opt = getopt(argc, argv, "h:p:n:t:l:fm:s:w:")) != -1) {
+    while ((opt = getopt(argc, argv, "h:p:n:t:l:fm:s:w:k:v:")) != -1) {
         switch (opt) {
             case 'h':
                 server_ip = optarg;
@@ -197,7 +238,7 @@ int main(int argc, char* argv[]) {
             case 'm':
                 get_ratio = std::stod(optarg);
                 if (get_ratio < 0.0 || get_ratio > 1.0) {
-                    fprintf(stderr, "A proporção de GET/SET deve estar entre 0 e 1.\n");
+                    fprintf(stderr, "-m <proportion>: should be between 0.0 and 1.0\n");
                     exit(EXIT_FAILURE);
                 }
                 break;
@@ -207,15 +248,21 @@ int main(int argc, char* argv[]) {
             case 'w':
                 warming_up_requests = std::stoi(optarg);
                 break;
+            case 'k':
+                key_size = std::stoi(optarg);
+                break;
+            case 'v':
+                value_size = std::stoi(optarg);
+                break;
             default:
-                fprintf(stderr, "Usage: %s -h <server_ip> -p <server_port> -n <num_requests> -t <num_threads> -l <list_of_cores> -m <GET/GET proportion> [-f] [-s <seed]\n", argv[0]);
+                usage(argv[0]);
                 exit(EXIT_FAILURE);
         }
     }
 
-    if (server_ip.empty() || server_port == 0 || num_requests == 0 || num_threads == 0 || core_list.empty()) {
-        fprintf(stderr, "Usage: %s -h <server_ip> -p <server_port> -n <num_requests> -t <num_threads> -l <list_of_integers>\n", argv[0]);
-        exit(-1);
+    if (server_ip.empty() || server_port == 0 || num_requests == 0 || num_threads == 0 || core_list.empty() || get_ratio > 1.0) {
+        usage(argv[0]);
+        exit(EXIT_FAILURE);
     }
 
     int warming_up_requests_per_thread = warming_up_requests / num_threads;
@@ -240,10 +287,10 @@ int main(int argc, char* argv[]) {
 
     if (direct_output) {
         printf("%lf,%lld,%lld,%lf\n", 
-                avg, 
-                percentiles[0], 
-                percentiles[4], 
-                throughput);
+            avg, 
+            percentiles[0], 
+            percentiles[4], 
+            throughput);
     } else {
         printf("Latency (us):\n");
         printf("avg: %lf\n", avg);                      // AVG
