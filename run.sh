@@ -98,7 +98,7 @@ for l in ${SERVER_LAYOUT_LIST[@]}; do
     error .tmp3
     echo -ne "p99.9\t$MEAN\t$ERROR\n" >> "rocksdb_output/$l.dat"
     error .tmp4
-    echo -ne "Throughput $MEAN\t$ERROR" >> "rocksdb_output/$l.dat"
+    echo -ne "Throughput $MEAN\t$ERROR\n" >> "rocksdb_output/$l.dat"
 done
 
 rm -rf .tmp* 1>/dev/null 2>/dev/null
