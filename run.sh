@@ -70,20 +70,23 @@ for l in ${SERVER_LAYOUT_LIST[@]}; do
         mv ${CLIENT_OUTPUT_FILE} $DIR/output$j.dat 1>/dev/null 2>/dev/null
     done
 
-    rm -rf .tmp 1>/dev/null 2>/dev/null
+    rm -rf .tmp* 1>/dev/null 2>/dev/null
     for j in `seq 0 $RUNS`; do
-        cat $DIR/output$j.dat | cut -d',' -f3 >> .tmp
+        cat $DIR/output$j.dat | cut -d',' -f1 >> .tmp1
+        cat $DIR/output$j.dat | cut -d',' -f2 >> .tmp2
+        cat $DIR/output$j.dat | cut -d',' -f3 >> .tmp3
+        cat $DIR/output$j.dat | cut -d',' -f4 >> .tmp4
     done
-    error .tmp
-    echo "p99" $MEAN $ERROR
-    rm -rf .tmp 1>/dev/null 2>/dev/null
-    for j in `seq 0 $RUNS`; do
-        cat $DIR/output$j.dat | cut -d',' -f4 >> .tmp
-    done
-    error .tmp
-    echo "Throughput" $MEAN $ERROR
+    error .tmp1
+    echo -ne "Average \t$MEAN\t$ERROR\n" >> "rocksdb_output/$l.dat"
+    error .tmp2
+    echo -ne "p50 $MEAN\t$ERROR\n" >> "rocksdb_output/$l.dat"
+    error .tmp3
+    echo -ne "p99.9 $MEAN\t$ERROR\n" >> "rocksdb_output/$l.dat"
+    error .tmp4
+    echo -ne "Throughput $MEAN\t$ERROR\n" >> "rocksdb_output/$l.dat"
 done
 
-rm -rf .tmp 1>/dev/null 2>/dev/null
+rm -rf .tmp* 1>/dev/null 2>/dev/null
 
 curl -d "Finished..." ntfy.sh/fabricio-experiment
