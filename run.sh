@@ -1,21 +1,23 @@
 #!/bin/bash
 
 PERF=0
-RUNS=19
+RUNS=9
 
 SERVER_TIMEOUT=30
-SERVER_IP=128.105.146.94
-SERVER_LAYOUT_LIST=("inline")
+SERVER_IP=10.90.0.20
+SERVER_LAYOUT_LIST=("dispatcher1")
+#SERVER_LAYOUT_LIST=("inline" "dispatcher1" "dispatcher2" "dispatcher4")
 SERVER_SEED_LIST=(1646203793 986508091 193720917 1093215650 772188468 711307909 645856549 1127581467 765061083 1050115427 4231379 1000215989 1382853168 1927405477 306097907 1344972625 2098183364 323989894 487415647 35498791 52157813)
 SERVER_CORES="1,3,5,7,9,11,13,15,17"
 SERVER_NUMBER_OF_CORES="8"
 
-CLIENT_SERVER_ADDR="10.10.1.1"
+CLIENT_SERVER_ADDR="192.168.100.1"
+CLIENT_SERVER_MAC="10:70:fd:45:57:21"
 CLIENT_SERVER_PORT=12345
 CLIENT_REQUESTS=100000
 CLIENT_CONNECTIONS=8
 CLIENT_WARMINGUP=100
-CLIENT_CORES="8,9,10,11,12,13,14,15"
+CLIENT_CORES="4,6,8,10,12,14,16,18"
 CLIENT_PROPORTION=1.0
 CLIENT_ROCKSDB_DIR="${HOME}/rocksdb"
 CLIENT_OUTPUT_FILE="output.dat"
@@ -38,17 +40,19 @@ process() {
     ./percentile ${PERCENTILE_2} .tmp >> $2/percentiles_${PERCENTILE_2}.txt
 }
 
+sudo arp -s ${CLIENT_SERVER_ADDR} ${CLIENT_SERVER_MAC}
+
 for l in ${SERVER_LAYOUT_LIST[@]}; do
-    if [ $l -eq "inline" ]; then
+    if [ $l = "inline" ]; then
         CLIENT_CONNECTIONS=8
         SERVER_NUMBER_OF_CORES="8"
-    elif [ $l -eq "dispatcher1" ]; then
-        CLIENT_CONNECTIONS=7
+    elif [ $l = "dispatcher1" ]; then
+        CLIENT_CONNECTIONS=2
         SERVER_NUMBER_OF_CORES="1 7"
-    elif [ $l -eq "dispatcher2" ]; then
-        CLIENT_CONNECTIONS=6
+    elif [ $l = "dispatcher2" ]; then
+        CLIENT_CONNECTIONS=2
         SERVER_NUMBER_OF_CORES="2 6"
-    elif [ $l -eq "dispatcher4" ]; then
+    elif [ $l = "dispatcher4" ]; then
         CLIENT_CONNECTIONS=4
         SERVER_NUMBER_OF_CORES="4 4"
     fi
@@ -63,8 +67,8 @@ for l in ${SERVER_LAYOUT_LIST[@]}; do
 
         ## Run the server
         SERVER_SCRIPT_ARGS="${SERVER_NUMBER_OF_CORES}"
-        # ssh ${SERVER_IP} "cd ROCKSDB/$l/demikernel; sh ./run_server.sh '${SERVER_CORES}' '${SERVER_SCRIPT_ARGS}' ${SERVER_TIMEOUT} ${PERF}" 1>/dev/null 2>/dev/null &
-        ssh ${SERVER_IP} "cd $l/demikernel; sudo pkill -9 server_db.elf 1>/dev/null 2>/dev/null; sh ./run_server.sh '${SERVER_CORES}' '${SERVER_SCRIPT_ARGS}' ${SERVER_TIMEOUT} ${PERF}" 1>/dev/null 2>/dev/null &
+        ssh ${SERVER_IP} "cd JUNE/ROCKSDB/$l/demikernel; sh ./run_server.sh '${SERVER_CORES}' '${SERVER_SCRIPT_ARGS}' ${SERVER_TIMEOUT} ${PERF}" 1>/dev/null 2>/dev/null &
+        # ssh ${SERVER_IP} "cd $l/demikernel; sudo pkill -9 server_db.elf 1>/dev/null 2>/dev/null; sh ./run_server.sh '${SERVER_CORES}' '${SERVER_SCRIPT_ARGS}' ${SERVER_TIMEOUT} ${PERF}" 1>/dev/null 2>/dev/null &
 
         ## Sleep a while
         sleep 5
@@ -85,6 +89,7 @@ for l in ${SERVER_LAYOUT_LIST[@]}; do
     done
 
     rm -rf .tmp* 1>/dev/null 2>/dev/null
+    rm -rf rocksdb_output/$l.dat 1>/dev/null 2>/dev/null
     for j in `seq 0 $RUNS`; do
         cat $DIR/output$j.dat | cut -d',' -f1 >> .tmp1
         cat $DIR/output$j.dat | cut -d',' -f2 >> .tmp2
