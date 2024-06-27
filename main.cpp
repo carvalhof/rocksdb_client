@@ -18,8 +18,8 @@
 #define BUFFER_SIZE 2048
 
 unsigned seed;
-std::mutex mtx;
 std::vector<int> core_list;
+std::vector<long long> global_latency;
 
 int key_size = 8;
 int value_size = 16;
@@ -29,21 +29,21 @@ int connect_to_server(const std::string& server_ip, int server_port) {
     struct sockaddr_in serv_addr;
 
     if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        perror("sock:");
-        exit(-1);
+        perror("socket");
+        return -1;
     }
 
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_port = htons(server_port);
 
     if (inet_pton(AF_INET, server_ip.c_str(), &serv_addr.sin_addr) <= 0) {
-        perror("inet_pton:");
-        exit(-1);
+        perror("inet_pton");
+        return -1;
     }
 
     if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-        perror("connect:");
-        exit(-1);
+        perror("connect");
+        return -1;
     }
 
     return sock;
@@ -88,69 +88,85 @@ long long send_command_and_measure_latency(int sock, const std::string& command)
     return duration.count();
 }
 
-std::vector<long long> calculate_percentiles(std::vector<long long>& latencies) {
-    std::sort(latencies.begin(), latencies.end());
-    std::vector<long long> percentiles;
+double calculate_throughput(int num_requests_per_thread, int num_threads_per_conn, std::vector<std::vector<long long>>& latencies) {
+    double throughput = 0.0;
+    for (auto latency_i : latencies) {
+        std::sort(latency_i.begin(), latency_i.end());
+        double total_time_i = std::accumulate(latency_i.begin(), latency_i.end(), 0LL) / 1e6;
+        
+        throughput += (num_requests_per_thread * num_threads_per_conn) / total_time_i;
+    }
 
-    percentiles.push_back(latencies[latencies.size() * 0.50]); // p50
-    percentiles.push_back(latencies[latencies.size() * 0.75]); // p75
-    percentiles.push_back(latencies[latencies.size() * 0.90]); // p90
-    percentiles.push_back(latencies[latencies.size() * 0.99]); // p99
-    percentiles.push_back(latencies[latencies.size() * 0.999]); // p99.9
-    percentiles.push_back(latencies[latencies.size() * 0.9999]); // p99.99
+    return throughput;
+}
+
+std::vector<long long> calculate_percentiles(std::vector<std::vector<long long>>& latencies) {
+    for (auto latency_i : latencies) {
+        for (auto latency : latency_i) {
+            global_latency.push_back(latency);
+        }
+    }
+
+    std::vector<long long> percentiles;
+    if (global_latency.size()) {
+        std::sort(global_latency.begin(), global_latency.end());
+
+        percentiles.push_back(global_latency[global_latency.size() * 0.50]); // p50
+        percentiles.push_back(global_latency[global_latency.size() * 0.75]); // p75
+        percentiles.push_back(global_latency[global_latency.size() * 0.90]); // p90
+        percentiles.push_back(global_latency[global_latency.size() * 0.99]); // p99
+        percentiles.push_back(global_latency[global_latency.size() * 0.999]); // p99.9
+        percentiles.push_back(global_latency[global_latency.size() * 0.9999]); // p99.99
+    }
 
     return percentiles;
 }
 
-double calculate_avg(const std::vector<long long>& latencias_micros) {
-    if (latencias_micros.empty()) {
+double calculate_avg(const std::vector<std::vector<long long>>& latencies) {
+    if (latencies.empty()) {
         return 0.0;
     }
 
-    long long soma = 0;
-    for (auto latencia : latencias_micros) {
-        soma += latencia;
+    double avg = 0;
+    for (auto latency_i : latencies) {
+        long long sum = 0;
+        for (auto latency : latency_i) {
+            sum += latency;
+        }
+        avg += (static_cast<double>(sum) / latency_i.size());
     }
 
-    return static_cast<double>(soma) / latencias_micros.size();
+    return avg / latencies.size();
 }
 
-void set_thread_affinity(std::thread& thread, int core_idx) {
+void set_thread_affinity(pthread_t thread, int core_idx) {
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
     CPU_SET(core_list[core_idx], &cpuset);
 
-    int rc = pthread_setaffinity_np(thread.native_handle(), sizeof(cpu_set_t), &cpuset);
+    int rc = pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
     if (rc != 0) {
-        perror("pthread_setaffinity_np:");
+        perror("pthread_setaffinity_np");
         exit(-1);
     }
 }
 
-void process_commands(int thread_id, int warming_up_requests_per_thread, int num_requests_per_thread, const std::string& server_ip, int server_port, std::vector<long long>& latencies, double get_ratio) {
+void inner_thread_function(int thread_id, int idx, int num_requests_per_thread, const std::string& server_ip, int server_port, std::vector<long long>& latencies, std::mutex& mtx, double get_ratio) {
+    set_thread_affinity(pthread_self(), thread_id);
+
     int sock = connect_to_server(server_ip, server_port + thread_id);
-    
-    std::mt19937 gen(seed + thread_id);
+
+    if (sock == -1) {
+        return;
+    }
+
+    std::mt19937 gen(seed + thread_id + (idx + 1));
     std::uniform_real_distribution<> dis(0.0, 1.0);
 
     std::string key_base = "key";
     std::string value_base = "value";
 
-    /* Warming up */
-    for (int i = 0; i < warming_up_requests_per_thread; i++) {
-        std::ostringstream key_stream;
-        key_stream << key_base << std::setw(key_size - key_base.length()) << std::setfill('0') << (thread_id * num_requests_per_thread + i);
-        std::string key = key_stream.str();
-
-        std::ostringstream value_stream;
-        value_stream << value_base << std::setw(value_size - value_base.length()) << std::setfill('0') << (thread_id * num_requests_per_thread + i);
-        std::string value = value_stream.str();
-
-        std::string set_command = "SET " + key + " " + value;
-        send_command(sock, set_command);
-    }
-
-    for (int i = 0; i < num_requests_per_thread; ++i) {
+    for (int i = 0; i < num_requests_per_thread; i++) {
         double rand_value = dis(gen);
         std::ostringstream key_stream;
         key_stream << key_base << std::setw(key_size - key_base.length()) << std::setfill('0') << (thread_id * num_requests_per_thread + i);
@@ -167,15 +183,88 @@ void process_commands(int thread_id, int warming_up_requests_per_thread, int num
             command = "GET " + key;
             latency = send_command_and_measure_latency(sock, command);
         } else {
-            // command = "SET " + key + " " + value;
             command = "SCAN";
             latency = send_scan_and_measure_latency(sock, command);
         }
-        // latency = send_command_and_measure_latency(sock, command);
 
         mtx.lock();
         latencies.push_back(latency);
         mtx.unlock();
+    }
+
+    close(sock);
+}
+
+void outer_thread_function(int thread_id, int warming_up_requests_per_conn, int num_requests_per_thread, int num_threads_per_conn, const std::string& server_ip, int server_port, std::vector<long long>& latencies, std::mutex& mtx, double get_ratio) {
+    set_thread_affinity(pthread_self(), thread_id);
+
+    int sock = connect_to_server(server_ip, server_port + thread_id);
+
+    if (sock == -1) {
+        return;
+    }
+    
+    std::mt19937 gen(seed + thread_id);
+    std::uniform_real_distribution<> dis(0.0, 1.0);
+
+    std::string key_base = "key";
+    std::string value_base = "value";
+
+    /* Warming up */
+    for (int i = 0; i < warming_up_requests_per_conn; i++) {
+        std::ostringstream key_stream;
+        key_stream << key_base << std::setw(key_size - key_base.length()) << std::setfill('0') << (thread_id * num_requests_per_thread + i);
+        std::string key = key_stream.str();
+
+        std::ostringstream value_stream;
+        value_stream << value_base << std::setw(value_size - value_base.length()) << std::setfill('0') << (thread_id * num_requests_per_thread + i);
+        std::string value = value_stream.str();
+
+        std::string set_command = "SET " + key + " " + value;
+        send_command(sock, set_command);
+    }
+    for (int i = 0; i < warming_up_requests_per_conn; i++) {
+        std::ostringstream key_stream;
+        key_stream << key_base << std::setw(key_size - key_base.length()) << std::setfill('0') << (thread_id * num_requests_per_thread + i);
+        std::string key = key_stream.str();
+
+        std::string get_command = "GET " + key;
+        send_command(sock, get_command);
+    }
+
+    std::vector<std::thread> inner_threads;
+    for (int i = 0; i < num_threads_per_conn - 1; i++) {
+        inner_threads.emplace_back(inner_thread_function, thread_id, i, num_requests_per_thread, server_ip, server_port, std::ref(latencies), std::ref(mtx), get_ratio);
+    }
+
+    for (int i = 0; i < num_requests_per_thread; i++) {
+        double rand_value = dis(gen);
+        std::ostringstream key_stream;
+        key_stream << key_base << std::setw(key_size - key_base.length()) << std::setfill('0') << (thread_id * num_requests_per_thread + i);
+        std::string key = key_stream.str();
+
+        std::ostringstream value_stream;
+        value_stream << value_base << std::setw(value_size - value_base.length()) << std::setfill('0') << (thread_id * num_requests_per_thread + i);
+        std::string value = value_stream.str();
+
+        long long latency;
+        std::string command;
+
+        if (rand_value < get_ratio) {
+            command = "GET " + key;
+            latency = send_command_and_measure_latency(sock, command);
+        } else {
+            command = "SCAN";
+            latency = send_scan_and_measure_latency(sock, command);
+        }
+
+        mtx.lock();
+        latencies.push_back(latency);
+        mtx.unlock();
+    }
+
+    for (auto& thread : inner_threads) {
+        thread.join();
     }
 
     close(sock);
@@ -187,8 +276,9 @@ void usage(char *app) {
         -h <server_ip> \
         -p <server_port> \
         -n <num_requests> \
-        -t <num_threads> \
+        -c <num_conn> \
         -l <list_of_cores> \
+        -o <output file> \
         -m <GET/SCAN proportion> \
         [-f] \
         [-s <seed>] \
@@ -202,14 +292,16 @@ int main(int argc, char* argv[]) {
     std::string server_ip;
     int server_port = 0;
     int num_requests = 0;
-    int num_threads = 0;
+    int num_conn = 0;
     bool direct_output = false;
     double get_ratio = 2.0;
     int warming_up_requests = 0;
+    int num_threads_per_conn = 1;
+    FILE *fp = stdout;
     seed = std::chrono::system_clock::now().time_since_epoch().count();
 
     int opt;
-    while ((opt = getopt(argc, argv, "h:p:n:t:l:fm:s:w:k:v:")) != -1) {
+    while ((opt = getopt(argc, argv, "h:p:n:c:t:l:fm:s:o:w:k:v:")) != -1) {
         switch (opt) {
             case 'h':
                 server_ip = optarg;
@@ -220,8 +312,13 @@ int main(int argc, char* argv[]) {
             case 'n':
                 num_requests = std::stoi(optarg);
                 break;
+            case 'c':
+                num_conn = std::stoi(optarg);
+                break;
             case 't':
-                num_threads = std::stoi(optarg);
+                num_threads_per_conn = std::stoi(optarg);
+                if(num_threads_per_conn < 1)
+                    exit(-1);
                 break;
             case 'l': {
                 std::string list_str = optarg;
@@ -245,6 +342,13 @@ int main(int argc, char* argv[]) {
             case 's':
                 seed = std::stoul(optarg);
                 break;
+            case 'o':
+                fp = fopen(optarg, "w");
+                if (!fp) {
+                    perror("fopen");
+                    exit(EXIT_FAILURE);
+                }
+                break;
             case 'w':
                 warming_up_requests = std::stoi(optarg);
                 break;
@@ -260,48 +364,49 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    if (server_ip.empty() || server_port == 0 || num_requests == 0 || num_threads == 0 || core_list.empty() || get_ratio > 1.0) {
+    if (server_ip.empty() || server_port == 0 || num_requests == 0 || num_conn == 0 || core_list.empty() || get_ratio > 1.0) {
         usage(argv[0]);
         exit(EXIT_FAILURE);
     }
 
-    int warming_up_requests_per_thread = warming_up_requests / num_threads;
-    int num_requests_per_thread = num_requests / num_threads;
-
-    std::vector<long long> latencies;
+    int warming_up_requests_per_conn = warming_up_requests / num_threads_per_conn;
+    int num_requests_per_thread = num_requests / num_threads_per_conn;
 
     std::vector<std::thread> threads;
-    for (int i = 0; i < num_threads; ++i) {
-        threads.emplace_back(process_commands, i, warming_up_requests_per_thread, num_requests_per_thread, std::ref(server_ip), server_port, std::ref(latencies), get_ratio);
-        set_thread_affinity(threads.back(), i);
+    std::vector<std::mutex> mtx(num_conn);
+    std::vector<std::vector<long long>> latencies(num_conn);
+
+    for (int i = 0; i < num_conn; i++) {
+        threads.emplace_back(outer_thread_function, i, warming_up_requests_per_conn, num_requests_per_thread, num_threads_per_conn, std::ref(server_ip), server_port, std::ref(latencies[i]), std::ref(mtx[i]), get_ratio);
     }
 
     for (auto& thread : threads) {
         thread.join();
     }
 
-    auto avg = calculate_avg(latencies);
     auto percentiles = calculate_percentiles(latencies);
-    double total_time = std::accumulate(latencies.begin(), latencies.end(), 0LL) / 1e6;
-    double throughput = (num_requests * num_threads) / total_time;
+    if (percentiles.size()) {
+        auto avg = calculate_avg(latencies);
+        auto throughput = calculate_throughput(num_requests_per_thread, num_threads_per_conn, latencies);
 
-    if (direct_output) {
-        printf("%lf,%lld,%lld,%lf\n", 
-            avg, 
-            percentiles[0], 
-            percentiles[4], 
-            throughput);
-    } else {
-        printf("Latency (us):\n");
-        printf("avg: %lf\n", avg);                      // AVG
-        printf("p50: %lld\n", percentiles[0]);          // p50
-        // printf("p75: %lld\n", percentiles[1]);       // p75
-        // printf("p90: %lld\n", percentiles[2]);       // p90
-        // printf("p99: %lld\n", percentiles[3]);       // p99
-        printf("p99.9: %lld\n", percentiles[4]);        // p99.9
-        // printf("p99.99: %lld\n", percentiles[5]);    // p99.99
-        printf("Throughput: %lf RPS\n", throughput);
+        if (direct_output) {
+            fprintf(fp, "%lf,%lld,%lld,%lf\n", 
+                avg, 
+                percentiles[0], 
+                percentiles[4], 
+                throughput);
+        } else {
+            fprintf(fp, "Latency (us):\n");
+            fprintf(fp, "avg: %lf\n", avg);                      // AVG
+            fprintf(fp, "p50: %lld\n", percentiles[0]);          // p50
+            // fprintf(fp, "p75: %lld\n", percentiles[1]);       // p75
+            // fprintf(fp, "p90: %lld\n", percentiles[2]);       // p90
+            // fprintf(fp, "p99: %lld\n", percentiles[3]);       // p99
+            fprintf(fp, "p99.9: %lld\n", percentiles[4]);        // p99.9
+            // fprintf(fp, "p99.99: %lld\n", percentiles[5]);    // p99.99
+            fprintf(fp, "Throughput: %lf RPS\n", throughput);
+        }
     }
-
+    
     return 0;
 }
