@@ -15,9 +15,12 @@
 #include <iomanip>
 #include <stdint.h>
 
-#define BUFFER_SIZE 2048
+#define BUFFER_SIZE 32768
 
 unsigned seed;
+std::mutex mtx;
+long total_latencies;
+double global_throughput;
 std::vector<int> core_list;
 std::vector<long long> global_latency;
 
@@ -88,16 +91,8 @@ long long send_command_and_measure_latency(int sock, const std::string& command)
     return duration.count();
 }
 
-double calculate_throughput(int num_requests_per_thread, int num_threads_per_conn, std::vector<std::vector<long long>>& latencies) {
-    double throughput = 0.0;
-    for (auto latency_i : latencies) {
-        std::sort(latency_i.begin(), latency_i.end());
-        double total_time_i = std::accumulate(latency_i.begin(), latency_i.end(), 0LL) / 1e6;
-        
-        throughput += (num_requests_per_thread * num_threads_per_conn) / total_time_i;
-    }
-
-    return throughput;
+double calculate_throughput() {
+    return global_throughput;
 }
 
 std::vector<long long> calculate_percentiles(std::vector<std::vector<long long>>& latencies) {
@@ -151,7 +146,7 @@ void set_thread_affinity(pthread_t thread, int core_idx) {
     }
 }
 
-void inner_thread_function(int thread_id, int idx, int num_requests_per_thread, const std::string& server_ip, int server_port, std::vector<long long>& latencies, std::mutex& mtx, double get_ratio) {
+void inner_thread_function(int thread_id, int idx, int num_requests_per_thread, const std::string& server_ip, int server_port, std::vector<long long>& latencies, double get_ratio) {
     set_thread_affinity(pthread_self(), thread_id);
 
     int sock = connect_to_server(server_ip, server_port + thread_id);
@@ -187,15 +182,13 @@ void inner_thread_function(int thread_id, int idx, int num_requests_per_thread, 
             latency = send_scan_and_measure_latency(sock, command);
         }
 
-        mtx.lock();
         latencies.push_back(latency);
-        mtx.unlock();
     }
 
     close(sock);
 }
 
-void outer_thread_function(int thread_id, int warming_up_requests_per_conn, int num_requests_per_thread, int num_threads_per_conn, const std::string& server_ip, int server_port, std::vector<long long>& latencies, std::mutex& mtx, double get_ratio) {
+void outer_thread_function(int thread_id, int warming_up_requests_per_conn, int num_requests_per_thread, int num_threads_per_conn, const std::string& server_ip, int server_port, std::vector<long long>& latencies, double get_ratio) {
     set_thread_affinity(pthread_self(), thread_id);
 
     int sock = connect_to_server(server_ip, server_port + thread_id);
@@ -233,8 +226,10 @@ void outer_thread_function(int thread_id, int warming_up_requests_per_conn, int 
     }
 
     std::vector<std::thread> inner_threads;
+    std::vector<std::vector<long long>> latencies_i(num_threads_per_conn - 1);
+
     for (int i = 0; i < num_threads_per_conn - 1; i++) {
-        inner_threads.emplace_back(inner_thread_function, thread_id, i, num_requests_per_thread, server_ip, server_port, std::ref(latencies), std::ref(mtx), get_ratio);
+        inner_threads.emplace_back(inner_thread_function, thread_id, i, num_requests_per_thread, server_ip, server_port, std::ref(latencies_i[i]), get_ratio);
     }
 
     for (int i = 0; i < num_requests_per_thread; i++) {
@@ -258,33 +253,41 @@ void outer_thread_function(int thread_id, int warming_up_requests_per_conn, int 
             latency = send_scan_and_measure_latency(sock, command);
         }
 
-        mtx.lock();
         latencies.push_back(latency);
-        mtx.unlock();
     }
 
     for (auto& thread : inner_threads) {
         thread.join();
     }
 
+    double throughput = 0.0;
+    for(auto ll : latencies_i) {
+        std::sort(ll.begin(), ll.end());
+        double total_time_i = std::accumulate(ll.begin(), ll.end(), 0LL) / 1e6;
+        throughput += (num_requests_per_thread / total_time_i);
+    }
+
+    std::sort(latencies.begin(), latencies.end());
+    double total_time_i = std::accumulate(latencies.begin(), latencies.end(), 0LL) / 1e6;
+    throughput += (num_requests_per_thread / total_time_i);
+
+    for(auto ll : latencies_i) {
+        for(auto l : ll) {
+            latencies.push_back(l);
+        }
+    }
+
+    mtx.lock();
+    total_latencies += latencies.size();
+    global_throughput += throughput;
+    mtx.unlock();
+
     close(sock);
 }
 
 void usage(char *app) {
     fprintf(stderr, 
-        "Usage: %s \
-        -h <server_ip> \
-        -p <server_port> \
-        -n <num_requests> \
-        -c <num_conn> \
-        -l <list_of_cores> \
-        -o <output file> \
-        -m <GET/SCAN proportion> \
-        [-f] \
-        [-s <seed>] \
-        [-w <warming up>] \
-        [-k <key size>] \
-        [-v <value size>]\n", app
+        "Usage: %s -h <server_ip> -p <server_port> -n <num_requests> -c <num_conn> -l <list_of_cores> -o <output file> -m <GET/SCAN proportion> [-f] [-s <seed>] [-w <warming up>] [-k <key size>] [-v <value size>]\n", app
     );
 }
 
@@ -373,11 +376,10 @@ int main(int argc, char* argv[]) {
     int num_requests_per_thread = num_requests / num_threads_per_conn;
 
     std::vector<std::thread> threads;
-    std::vector<std::mutex> mtx(num_conn);
     std::vector<std::vector<long long>> latencies(num_conn);
 
     for (int i = 0; i < num_conn; i++) {
-        threads.emplace_back(outer_thread_function, i, warming_up_requests_per_conn, num_requests_per_thread, num_threads_per_conn, std::ref(server_ip), server_port, std::ref(latencies[i]), std::ref(mtx[i]), get_ratio);
+        threads.emplace_back(outer_thread_function, i, warming_up_requests_per_conn, num_requests_per_thread, num_threads_per_conn, std::ref(server_ip), server_port, std::ref(latencies[i]), get_ratio);
     }
 
     for (auto& thread : threads) {
@@ -387,14 +389,15 @@ int main(int argc, char* argv[]) {
     auto percentiles = calculate_percentiles(latencies);
     if (percentiles.size()) {
         auto avg = calculate_avg(latencies);
-        auto throughput = calculate_throughput(num_requests_per_thread, num_threads_per_conn, latencies);
+        auto throughput = calculate_throughput();
 
         if (direct_output) {
-            fprintf(fp, "%lf,%lld,%lld,%lf\n", 
+            fprintf(fp, "%lf,%lld,%lld,%lf,%ld\n",
                 avg, 
                 percentiles[0], 
                 percentiles[4], 
-                throughput);
+                throughput,
+                total_latencies);
         } else {
             fprintf(fp, "Latency (us):\n");
             fprintf(fp, "avg: %lf\n", avg);                      // AVG
@@ -405,6 +408,7 @@ int main(int argc, char* argv[]) {
             fprintf(fp, "p99.9: %lld\n", percentiles[4]);        // p99.9
             // fprintf(fp, "p99.99: %lld\n", percentiles[5]);    // p99.99
             fprintf(fp, "Throughput: %lf RPS\n", throughput);
+            fprintf(fp, "#Latency: %ld\n", total_latencies);
         }
     }
     
