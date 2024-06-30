@@ -280,7 +280,8 @@ static void start_warming_up(uint16_t portid, uint8_t qid) {
 		tcp_control_block_t *block = &tcp_control_blocks[flow_id];
 
 		// fill the packet fields
-		uint32_t frame_size = 14+20+20+warming_array[i].size+2*sizeof(uint64_t);
+		// uint32_t frame_size = 14+20+20+warming_array[i].size+2*sizeof(uint64_t);
+		uint32_t frame_size = 14+20+20+1400+2*sizeof(uint64_t);
 		fill_tcp_packet(block, pkt, frame_size);
 
 		// fill the payload
@@ -330,7 +331,8 @@ static int lcore_tx(void *arg) {
 		pkt = rte_pktmbuf_alloc(pktmbuf_pool_tx);
 
 		// fill the packet fields
-		uint32_t frame_size = 14+20+20+application_array[i].size+2*sizeof(uint64_t);
+		// uint32_t frame_size = 14+20+20+application_array[i].size+2*sizeof(uint64_t);
+		uint32_t frame_size = 14+20+20+1400+2*sizeof(uint64_t);
 		fill_tcp_packet(block, pkt, frame_size);
 
 		// fill the payload
